@@ -1,3 +1,20 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse.internal;
 
 import org.apache.flink.api.common.io.DefaultInputSplitAssigner;
@@ -6,10 +23,10 @@ import org.apache.flink.api.common.io.statistics.BaseStatistics;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.clickhouse.internal.common.DistributedEngineFullSchema;
 import org.apache.flink.connector.clickhouse.internal.connection.ClickHouseConnectionProvider;
 import org.apache.flink.connector.clickhouse.internal.converter.ClickHouseRowConverter;
 import org.apache.flink.connector.clickhouse.internal.options.ClickHouseReadOptions;
+import org.apache.flink.connector.clickhouse.internal.schema.DistributedEngineFull;
 import org.apache.flink.connector.clickhouse.split.ClickHouseParametersProvider;
 import org.apache.flink.core.io.GenericInputSplit;
 import org.apache.flink.core.io.InputSplit;
@@ -26,7 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
-import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.getAndParseDistributedEngineSchema;
+import static org.apache.flink.connector.clickhouse.util.ClickHouseJdbcUtil.getDistributedEngineFull;
 
 /** Abstract Clickhouse input format. */
 public abstract class AbstractClickHouseInputFormat extends RichInputFormat<RowData, InputSplit>
@@ -121,7 +138,7 @@ public abstract class AbstractClickHouseInputFormat extends RichInputFormat<RowD
 
         private Properties connectionProperties;
 
-        private DistributedEngineFullSchema engineFullSchema;
+        private int[] shardIds;
 
         private Map<Integer, String> shardMap;
 
@@ -183,65 +200,61 @@ public abstract class AbstractClickHouseInputFormat extends RichInputFormat<RowD
             Preconditions.checkNotNull(fieldTypes);
             Preconditions.checkNotNull(rowDataTypeInfo);
 
-            int[] shardIds = null;
-            if (readOptions.isUseLocal()) {
-                shardIds = initShardInfo();
-            }
-            if (readOptions.isUseLocal() || readOptions.getPartitionColumn() != null) {
-                initPartitionInfo(shardIds);
-            }
-
-            LogicalType[] logicalTypes =
-                    Arrays.stream(fieldTypes)
-                            .map(DataType::getLogicalType)
-                            .toArray(LogicalType[]::new);
-            return readOptions.isUseLocal()
-                    ? createShardInputFormat(logicalTypes)
-                    : createBatchOutputFormat(logicalTypes);
-        }
-
-        private int[] initShardInfo() {
             ClickHouseConnectionProvider connectionProvider = null;
             try {
                 connectionProvider =
                         new ClickHouseConnectionProvider(readOptions, connectionProperties);
-                engineFullSchema =
-                        getAndParseDistributedEngineSchema(
+                DistributedEngineFull engineFullSchema =
+                        getDistributedEngineFull(
                                 connectionProvider.getOrCreateConnection(),
                                 readOptions.getDatabaseName(),
                                 readOptions.getTableName());
+                boolean isDistributed = engineFullSchema != null;
 
-                if (engineFullSchema == null) {
-                    throw new RuntimeException(
-                            String.format(
-                                    "table `%s`.`%s` is not a Distributed table",
-                                    readOptions.getDatabaseName(), readOptions.getTableName()));
+                if (isDistributed && readOptions.isUseLocal()) {
+                    initShardInfo(connectionProvider, engineFullSchema);
+                    initPartitionInfo();
+                } else if (readOptions.getPartitionColumn() != null) {
+                    initPartitionInfo();
                 }
 
-                List<String> shardUrls =
-                        connectionProvider.getShardUrls(engineFullSchema.getCluster());
-                if (!shardUrls.isEmpty()) {
-                    int len = shardUrls.size();
-                    int[] dataIds = new int[len];
-                    shardMap = new HashMap<>(len);
-                    for (int i = 0; i < len; i++) {
-                        shardMap.put(i, shardUrls.get(i));
-                        dataIds[i] = i;
-                    }
-                    return dataIds;
-                }
-            } catch (Exception exception) {
-                throw new RuntimeException("Get shard table info failed.", exception);
+                LogicalType[] logicalTypes =
+                        Arrays.stream(fieldTypes)
+                                .map(DataType::getLogicalType)
+                                .toArray(LogicalType[]::new);
+                return isDistributed && readOptions.isUseLocal()
+                        ? createShardInputFormat(logicalTypes, engineFullSchema)
+                        : createBatchInputFormat(logicalTypes);
+            } catch (Exception e) {
+                throw new RuntimeException("Build ClickHouse input format failed.", e);
             } finally {
                 if (connectionProvider != null) {
                     connectionProvider.closeConnections();
                 }
             }
-
-            return null;
         }
 
-        private void initPartitionInfo(int[] shardIds) {
+        private void initShardInfo(
+                ClickHouseConnectionProvider connectionProvider,
+                DistributedEngineFull engineFullSchema) {
+            try {
+                List<String> shardUrls =
+                        connectionProvider.getShardUrls(engineFullSchema.getCluster());
+                if (!shardUrls.isEmpty()) {
+                    int len = shardUrls.size();
+                    shardIds = new int[len];
+                    shardMap = new HashMap<>(len);
+                    for (int i = 0; i < len; i++) {
+                        shardIds[i] = i;
+                        shardMap.put(i, shardUrls.get(i));
+                    }
+                }
+            } catch (Exception exception) {
+                throw new RuntimeException("Get shard table info failed.", exception);
+            }
+        }
+
+        private void initPartitionInfo() {
             try {
                 ClickHouseParametersProvider parametersProvider =
                         new ClickHouseParametersProvider.Builder()
@@ -266,7 +279,8 @@ public abstract class AbstractClickHouseInputFormat extends RichInputFormat<RowD
             }
         }
 
-        private AbstractClickHouseInputFormat createShardInputFormat(LogicalType[] logicalTypes) {
+        private AbstractClickHouseInputFormat createShardInputFormat(
+                LogicalType[] logicalTypes, DistributedEngineFull engineFullSchema) {
             return new ClickHouseShardInputFormat(
                     new ClickHouseConnectionProvider(readOptions, connectionProperties),
                     new ClickHouseRowConverter(RowType.of(logicalTypes)),
@@ -282,7 +296,7 @@ public abstract class AbstractClickHouseInputFormat extends RichInputFormat<RowD
                     limit);
         }
 
-        private AbstractClickHouseInputFormat createBatchOutputFormat(LogicalType[] logicalTypes) {
+        private AbstractClickHouseInputFormat createBatchInputFormat(LogicalType[] logicalTypes) {
             return new ClickHouseBatchInputFormat(
                     new ClickHouseConnectionProvider(readOptions, connectionProperties),
                     new ClickHouseRowConverter(RowType.of(logicalTypes)),

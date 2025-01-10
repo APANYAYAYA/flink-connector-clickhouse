@@ -1,10 +1,27 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse.util;
 
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
 import org.apache.flink.table.types.DataType;
 
-import ru.yandex.clickhouse.response.ClickHouseColumnInfo;
+import com.clickhouse.data.ClickHouseColumn;
 
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -12,15 +29,20 @@ import java.util.regex.Pattern;
 import static org.apache.flink.table.types.logical.DecimalType.MAX_PRECISION;
 
 /** Type utils. */
-public class ClickHouseTypeUtil {
+public class DataTypeUtil {
 
     private static final Pattern INTERNAL_TYPE_PATTERN = Pattern.compile(".*?\\((?<type>.*)\\)");
 
-    /** Convert clickhouse data type to flink data type. Whether to indicate nullable ? */
-    public static DataType toFlinkType(ClickHouseColumnInfo clickHouseColumnInfo) {
-        switch (clickHouseColumnInfo.getClickHouseDataType()) {
+    /**
+     * Convert clickhouse data type to flink data type. <br>
+     * TODO: Whether to indicate nullable?
+     */
+    public static DataType toFlinkType(ClickHouseColumn clickHouseColumnInfo) {
+        switch (clickHouseColumnInfo.getDataType()) {
             case Int8:
                 return DataTypes.TINYINT();
+            case Bool:
+                return DataTypes.BOOLEAN();
             case Int16:
             case UInt8:
                 return DataTypes.SMALLINT();
@@ -70,6 +92,7 @@ public class ClickHouseTypeUtil {
             case UUID:
                 return DataTypes.VARCHAR(clickHouseColumnInfo.getPrecision());
             case Date:
+            case Date32:
                 return DataTypes.DATE();
             case DateTime:
             case DateTime32:
@@ -78,12 +101,10 @@ public class ClickHouseTypeUtil {
             case Array:
                 String arrayBaseType =
                         getInternalClickHouseType(clickHouseColumnInfo.getOriginalTypeName());
-                ClickHouseColumnInfo arrayBaseColumnInfo =
-                        ClickHouseColumnInfo.parse(
-                                arrayBaseType,
-                                clickHouseColumnInfo.getColumnName() + ".array_base",
-                                clickHouseColumnInfo.getTimeZone());
-                return DataTypes.ARRAY(toFlinkType(arrayBaseColumnInfo));
+                String arrayBaseName = clickHouseColumnInfo.getColumnName() + ".array_base";
+                ClickHouseColumn clickHouseColumn =
+                        ClickHouseColumn.of(arrayBaseName, arrayBaseType);
+                return DataTypes.ARRAY(toFlinkType(clickHouseColumn));
             case Map:
                 return DataTypes.MAP(
                         toFlinkType(clickHouseColumnInfo.getKeyInfo()),
@@ -93,7 +114,7 @@ public class ClickHouseTypeUtil {
             case AggregateFunction:
             default:
                 throw new UnsupportedOperationException(
-                        "Unsupported type:" + clickHouseColumnInfo.getClickHouseDataType());
+                        "Unsupported type:" + clickHouseColumnInfo.getDataType());
         }
     }
 

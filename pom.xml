@@ -35,13 +35,13 @@
 
 		<checkstyle.version>8.14</checkstyle.version>
 		<junit.version>4.13.2</junit.version>
-<!--		<clickhouse-jdbc.version>0.7.2</clickhouse-jdbc.version>-->
-		<clickhouse-jdbc.version>0.3.1</clickhouse-jdbc.version>
+		<clickhouse-jdbc.version>0.6.4</clickhouse-jdbc.version>
 		<scala.binary.version>2.11</scala.binary.version>
 		<flink.version>1.14.6</flink.version>
 		<flink.scope>provided</flink.scope>
 		<guava.version>29.0-jre</guava.version>
 		<jackson.version>2.12.4</jackson.version>
+		<httpclient5.version>5.2.1</httpclient5.version>
 
 		<maven-compiler-plugin.version>3.8.1</maven-compiler-plugin.version>
 		<maven-shade-plugin.version>3.2.4</maven-shade-plugin.version>
@@ -57,32 +57,10 @@
 			<version>${junit.version}</version>
 			<scope>test</scope>
 		</dependency>
-<!--		<dependency>-->
-<!--			<groupId>com.clickhouse</groupId>-->
-<!--			<artifactId>clickhouse-jdbc</artifactId>-->
-<!--			<version>${clickhouse-jdbc.version}</version>-->
-<!--			<classifier>all</classifier>-->
-<!--			<exclusions>-->
-<!--				<exclusion>-->
-<!--					<groupId>*</groupId>-->
-<!--					<artifactId>*</artifactId>-->
-<!--				</exclusion>-->
-<!--			</exclusions>-->
-<!--		</dependency>-->
 		<dependency>
-			<groupId>ru.yandex.clickhouse</groupId>
+			<groupId>com.clickhouse</groupId>
 			<artifactId>clickhouse-jdbc</artifactId>
 			<version>${clickhouse-jdbc.version}</version>
-			<exclusions>
-				<exclusion>
-					<groupId>com.fasterxml.jackson.core</groupId>
-					<artifactId>jackson-core</artifactId>
-				</exclusion>
-				<exclusion>
-					<groupId>com.fasterxml.jackson.core</groupId>
-					<artifactId>jackson-databind</artifactId>
-				</exclusion>
-			</exclusions>
 		</dependency>
 		<dependency>
 			<groupId>com.fasterxml.jackson.core</groupId>
@@ -102,6 +80,13 @@
 			<artifactId>flink-runtime</artifactId>
 			<version>${flink.version}</version>
 			<scope>${flink.scope}</scope>
+		</dependency>
+		<!--	Http	-->
+
+		<dependency>
+			<groupId>org.apache.httpcomponents.client5</groupId>
+			<artifactId>httpclient5</artifactId>
+			<version>${httpclient5.version}</version>
 		</dependency>
 	</dependencies>
 

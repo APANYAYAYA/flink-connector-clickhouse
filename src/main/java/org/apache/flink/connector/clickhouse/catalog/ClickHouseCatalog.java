@@ -1,9 +1,25 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse.catalog;
 
 import org.apache.flink.connector.clickhouse.ClickHouseDynamicTableFactory;
-import org.apache.flink.connector.clickhouse.internal.common.DistributedEngineFullSchema;
-import org.apache.flink.connector.clickhouse.util.ClickHouseTypeUtil;
-import org.apache.flink.connector.clickhouse.util.ClickHouseUtil;
+import org.apache.flink.connector.clickhouse.internal.schema.DistributedEngineFull;
+import org.apache.flink.connector.clickhouse.util.DataTypeUtil;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.catalog.AbstractCatalog;
 import org.apache.flink.table.catalog.CatalogBaseTable;
@@ -32,15 +48,15 @@ import org.apache.flink.table.catalog.stats.CatalogTableStatistics;
 import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.factories.Factory;
 import org.apache.flink.table.types.DataType;
-import org.apache.flink.util.StringUtils;
 
+import com.clickhouse.client.config.ClickHouseDefaults;
+import com.clickhouse.data.ClickHouseColumn;
+import com.clickhouse.jdbc.ClickHouseConnection;
+import com.clickhouse.jdbc.ClickHouseDriver;
+import com.clickhouse.jdbc.ClickHouseResultSetMetaData;
+import com.clickhouse.jdbc.ClickHouseStatement;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.yandex.clickhouse.BalancedClickhouseDataSource;
-import ru.yandex.clickhouse.ClickHouseConnection;
-import ru.yandex.clickhouse.response.ClickHouseColumnInfo;
-import ru.yandex.clickhouse.response.ClickHouseResultSetMetaData;
-import ru.yandex.clickhouse.settings.ClickHouseQueryParam;
 
 import javax.annotation.Nullable;
 
@@ -61,7 +77,9 @@ import static org.apache.flink.connector.clickhouse.config.ClickHouseConfig.PASS
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfig.TABLE_NAME;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfig.URL;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfig.USERNAME;
+import static org.apache.flink.connector.clickhouse.util.ClickHouseJdbcUtil.getDistributedEngineFull;
 import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.StringUtils.isNullOrWhitespaceOnly;
 
 /** ClickHouse catalog. */
 public class ClickHouseCatalog extends AbstractCatalog {
@@ -110,14 +128,11 @@ public class ClickHouseCatalog extends AbstractCatalog {
             Map<String, String> properties) {
         super(catalogName, defaultDatabase == null ? DEFAULT_DATABASE : defaultDatabase);
 
-        checkArgument(
-                !StringUtils.isNullOrWhitespaceOnly(baseUrl), "baseUrl cannot be null or empty");
-        checkArgument(
-                !StringUtils.isNullOrWhitespaceOnly(username), "username cannot be null or empty");
-        checkArgument(
-                !StringUtils.isNullOrWhitespaceOnly(password), "password cannot be null or empty");
+        checkArgument(!isNullOrWhitespaceOnly(baseUrl), "baseUrl cannot be null or empty");
+        checkArgument(!isNullOrWhitespaceOnly(username), "username cannot be null or empty");
+        checkArgument(!isNullOrWhitespaceOnly(password), "password cannot be null or empty");
 
-        this.baseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+        this.baseUrl = baseUrl;
         this.username = username;
         this.password = password;
         this.ignorePrimaryKey =
@@ -131,14 +146,11 @@ public class ClickHouseCatalog extends AbstractCatalog {
         try {
             Properties configuration = new Properties();
             configuration.putAll(properties);
-            configuration.setProperty(ClickHouseQueryParam.USER.getKey(), username);
-            configuration.setProperty(ClickHouseQueryParam.PASSWORD.getKey(), password);
-            String jdbcUrl = ClickHouseUtil.getJdbcUrl(baseUrl, getDefaultDatabase());
-            BalancedClickhouseDataSource dataSource =
-                    new BalancedClickhouseDataSource(jdbcUrl, configuration);
-            dataSource.actualize();
-            connection = dataSource.getConnection();
-            LOG.info("Created catalog {}, established connection to {}", getName(), jdbcUrl);
+            configuration.setProperty(ClickHouseDefaults.USER.getKey(), username);
+            configuration.setProperty(ClickHouseDefaults.PASSWORD.getKey(), password);
+            ClickHouseDriver driver = new ClickHouseDriver();
+            connection = driver.connect(baseUrl, configuration);
+            LOG.info("Created catalog {}, established connection to {}", getName(), baseUrl);
         } catch (Exception e) {
             throw new CatalogException(String.format("Opening catalog %s failed.", getName()), e);
         }
@@ -192,7 +204,7 @@ public class ClickHouseCatalog extends AbstractCatalog {
 
     @Override
     public boolean databaseExists(String databaseName) throws CatalogException {
-        checkArgument(!StringUtils.isNullOrWhitespaceOnly(databaseName));
+        checkArgument(!isNullOrWhitespaceOnly(databaseName));
 
         return listDatabases().contains(databaseName);
     }
@@ -269,8 +281,8 @@ public class ClickHouseCatalog extends AbstractCatalog {
         String databaseName = tablePath.getDatabaseName();
         String tableName = tablePath.getObjectName();
         try {
-            DistributedEngineFullSchema engineFullSchema =
-                    ClickHouseUtil.getAndParseDistributedEngineSchema(
+            DistributedEngineFull engineFullSchema =
+                    getDistributedEngineFull(
                             connection, tablePath.getDatabaseName(), tablePath.getObjectName());
             if (engineFullSchema != null) {
                 databaseName = engineFullSchema.getDatabase();
@@ -297,22 +309,23 @@ public class ClickHouseCatalog extends AbstractCatalog {
         // types? 3. All queried data will be obtained before PreparedStatement is closed, so we
         // must add `limit 0` statement to avoid data transmission to the client, look at
         // `ChunkedInputStream.close()` for more info.
-        try (PreparedStatement stmt =
-                connection.prepareStatement(
-                        String.format(
-                                "SELECT * from `%s`.`%s` limit 0", databaseName, tableName))) {
+        try (ClickHouseStatement stmt = connection.createStatement();
+                ResultSet rs =
+                        stmt.executeQuery(
+                                String.format(
+                                        "SELECT * from `%s`.`%s` limit 0",
+                                        databaseName, tableName))) {
             ClickHouseResultSetMetaData metaData =
-                    stmt.getMetaData().unwrap(ClickHouseResultSetMetaData.class);
-            Method getColMethod = metaData.getClass().getDeclaredMethod("getCol", int.class);
+                    rs.getMetaData().unwrap(ClickHouseResultSetMetaData.class);
+            Method getColMethod = metaData.getClass().getDeclaredMethod("getColumn", int.class);
             getColMethod.setAccessible(true);
 
             List<String> primaryKeys = getPrimaryKeys(databaseName, tableName);
             TableSchema.Builder builder = TableSchema.builder();
             for (int idx = 1; idx <= metaData.getColumnCount(); idx++) {
-                ClickHouseColumnInfo columnInfo =
-                        (ClickHouseColumnInfo) getColMethod.invoke(metaData, idx);
+                ClickHouseColumn columnInfo = (ClickHouseColumn) getColMethod.invoke(metaData, idx);
                 String columnName = columnInfo.getColumnName();
-                DataType columnType = ClickHouseTypeUtil.toFlinkType(columnInfo);
+                DataType columnType = DataTypeUtil.toFlinkType(columnInfo);
                 if (primaryKeys.contains(columnName)) {
                     columnType = columnType.notNull();
                 }

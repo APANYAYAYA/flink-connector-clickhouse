@@ -1,24 +1,41 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse;
 
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.connector.clickhouse.internal.options.ClickHouseDmlOptions;
 import org.apache.flink.connector.clickhouse.internal.options.ClickHouseReadOptions;
-import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.catalog.ResolvedCatalogTable;
+import org.apache.flink.table.catalog.UniqueConstraint;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.factories.DynamicTableSinkFactory;
 import org.apache.flink.table.factories.DynamicTableSourceFactory;
 import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.factories.FactoryUtil.TableFactoryHelper;
-import org.apache.flink.table.utils.TableSchemaUtils;
 
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Properties;
 import java.util.Set;
 
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfig.IDENTIFIER;
+import static org.apache.flink.connector.clickhouse.config.ClickHouseConfig.PROPERTIES_PREFIX;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.CATALOG_IGNORE_PRIMARY_KEY;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.DATABASE_NAME;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.PASSWORD;
@@ -33,14 +50,13 @@ import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptio
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SINK_PARALLELISM;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SINK_PARTITION_KEY;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SINK_PARTITION_STRATEGY;
-import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SINK_WRITE_LOCAL;
+import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SINK_SHARDING_USE_TABLE_DEF;
+import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SINK_UPDATE_STRATEGY;
+import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SinkShardingStrategy;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.TABLE_NAME;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.URL;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.USERNAME;
 import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.USE_LOCAL;
-import static org.apache.flink.connector.clickhouse.internal.partitioner.ClickHousePartitioner.BALANCED;
-import static org.apache.flink.connector.clickhouse.internal.partitioner.ClickHousePartitioner.HASH;
-import static org.apache.flink.connector.clickhouse.internal.partitioner.ClickHousePartitioner.SHUFFLE;
 import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.getClickHouseProperties;
 
 /** A {@link DynamicTableSinkFactory} for discovering {@link ClickHouseDynamicTableSink}. */
@@ -53,31 +69,49 @@ public class ClickHouseDynamicTableFactory
     public DynamicTableSink createDynamicTableSink(Context context) {
         TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         ReadableConfig config = helper.getOptions();
-        helper.validate();
+        helper.validateExcept(PROPERTIES_PREFIX);
         validateConfigOptions(config);
 
+        ResolvedCatalogTable catalogTable = context.getCatalogTable();
+        String[] primaryKeys =
+                catalogTable
+                        .getResolvedSchema()
+                        .getPrimaryKey()
+                        .map(UniqueConstraint::getColumns)
+                        .map(keys -> keys.toArray(new String[0]))
+                        .orElse(new String[0]);
+        Properties clickHouseProperties =
+                getClickHouseProperties(context.getCatalogTable().getOptions());
         return new ClickHouseDynamicTableSink(
                 getDmlOptions(config),
-                context.getCatalogTable(),
-                context.getCatalogTable().getResolvedSchema());
+                clickHouseProperties,
+                primaryKeys,
+                catalogTable.getPartitionKeys().toArray(new String[0]),
+                context.getCatalogTable().getResolvedSchema().toPhysicalRowDataType());
     }
 
     @Override
     public DynamicTableSource createDynamicTableSource(Context context) {
         TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         ReadableConfig config = helper.getOptions();
-        helper.validate();
+        helper.validateExcept(PROPERTIES_PREFIX);
         validateConfigOptions(config);
+
+        ResolvedCatalogTable catalogTable = context.getCatalogTable();
+        String[] primaryKeys =
+                catalogTable
+                        .getResolvedSchema()
+                        .getPrimaryKey()
+                        .map(UniqueConstraint::getColumns)
+                        .map(keys -> keys.toArray(new String[0]))
+                        .orElse(new String[0]);
 
         Properties clickHouseProperties =
                 getClickHouseProperties(context.getCatalogTable().getOptions());
-        TableSchema physicalSchema =
-                TableSchemaUtils.getPhysicalSchema(context.getCatalogTable().getSchema());
         return new ClickHouseDynamicTableSource(
                 getReadOptions(config),
                 clickHouseProperties,
-                context.getCatalogTable(),
-                physicalSchema);
+                context.getCatalogTable().getResolvedSchema().toPhysicalRowDataType());
     }
 
     @Override
@@ -103,9 +137,10 @@ public class ClickHouseDynamicTableFactory
         optionalOptions.add(SINK_BATCH_SIZE);
         optionalOptions.add(SINK_FLUSH_INTERVAL);
         optionalOptions.add(SINK_MAX_RETRIES);
-        optionalOptions.add(SINK_WRITE_LOCAL);
+        optionalOptions.add(SINK_UPDATE_STRATEGY);
         optionalOptions.add(SINK_PARTITION_STRATEGY);
         optionalOptions.add(SINK_PARTITION_KEY);
+        optionalOptions.add(SINK_SHARDING_USE_TABLE_DEF);
         optionalOptions.add(SINK_IGNORE_DELETE);
         optionalOptions.add(SINK_PARALLELISM);
         optionalOptions.add(CATALOG_IGNORE_PRIMARY_KEY);
@@ -117,18 +152,18 @@ public class ClickHouseDynamicTableFactory
     }
 
     private void validateConfigOptions(ReadableConfig config) {
-        String partitionStrategy = config.get(SINK_PARTITION_STRATEGY);
-        if (!Arrays.asList(HASH, BALANCED, SHUFFLE).contains(partitionStrategy)) {
-            throw new IllegalArgumentException(
-                    String.format("Unknown sink.partition-strategy `%s`", partitionStrategy));
-        } else if (HASH.equals(partitionStrategy)
+        SinkShardingStrategy shardingStrategy = config.get(SINK_PARTITION_STRATEGY);
+        if (!config.get(SINK_SHARDING_USE_TABLE_DEF)
+                && shardingStrategy.shardingKeyNeeded
                 && !config.getOptional(SINK_PARTITION_KEY).isPresent()) {
             throw new IllegalArgumentException(
-                    "A partition key must be provided for hash partition strategy");
+                    "A sharding key must be provided for sharding strategy: "
+                            + shardingStrategy.value);
         } else if (config.getOptional(USERNAME).isPresent()
                 ^ config.getOptional(PASSWORD).isPresent()) {
             throw new IllegalArgumentException(
                     "Either all or none of username and password should be provided");
+
         } else if (config.getOptional(SCAN_PARTITION_COLUMN).isPresent()
                 ^ config.getOptional(SCAN_PARTITION_NUM).isPresent()
                 ^ config.getOptional(SCAN_PARTITION_LOWER_BOUND).isPresent()
@@ -148,10 +183,11 @@ public class ClickHouseDynamicTableFactory
                 .withBatchSize(config.get(SINK_BATCH_SIZE))
                 .withFlushInterval(config.get(SINK_FLUSH_INTERVAL))
                 .withMaxRetries(config.get(SINK_MAX_RETRIES))
-                .withWriteLocal(config.get(SINK_WRITE_LOCAL))
                 .withUseLocal(config.get(USE_LOCAL))
-                .withPartitionStrategy(config.get(SINK_PARTITION_STRATEGY))
-                .withPartitionKey(config.get(SINK_PARTITION_KEY))
+                .withUpdateStrategy(config.get(SINK_UPDATE_STRATEGY))
+                .withShardingStrategy(config.get(SINK_PARTITION_STRATEGY))
+                .withShardingKey(config.get(SINK_PARTITION_KEY))
+                .withUseTableDef(config.get(SINK_SHARDING_USE_TABLE_DEF))
                 .withIgnoreDelete(config.get(SINK_IGNORE_DELETE))
                 .withParallelism(config.get(SINK_PARALLELISM))
                 .build();

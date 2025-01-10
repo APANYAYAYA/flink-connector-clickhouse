@@ -1,29 +1,42 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse.internal.connection;
 
 import org.apache.flink.connector.clickhouse.internal.options.ClickHouseConnectionOptions;
-import org.apache.flink.connector.clickhouse.util.ClickHouseUtil;
+import org.apache.flink.connector.clickhouse.internal.schema.ClusterSpec;
+import org.apache.flink.connector.clickhouse.internal.schema.ShardSpec;
 
-import org.apache.http.HttpResponse;
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.client.utils.URIBuilder;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-import org.apache.http.util.EntityUtils;
+import com.clickhouse.client.config.ClickHouseDefaults;
+import com.clickhouse.jdbc.ClickHouseConnection;
+import com.clickhouse.jdbc.ClickHouseDriver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.yandex.clickhouse.BalancedClickhouseDataSource;
-import ru.yandex.clickhouse.ClickHouseConnection;
-import ru.yandex.clickhouse.settings.ClickHouseProperties;
 
 import java.io.Serializable;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+
+import static java.util.stream.Collectors.toList;
+import static org.apache.flink.connector.clickhouse.util.ClickHouseJdbcUtil.getClusterSpec;
 
 /** ClickHouse connection provider. Use ClickHouseDriver to create a connection. */
 public class ClickHouseConnectionProvider implements Serializable {
@@ -31,18 +44,6 @@ public class ClickHouseConnectionProvider implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private static final Logger LOG = LoggerFactory.getLogger(ClickHouseConnectionProvider.class);
-
-    private static final Pattern HTTP_PORT_PATTERN =
-            Pattern.compile("You must use port (?<port>[0-9]+) for HTTP.");
-
-    /**
-     * Query different shard info
-     *
-     * <p>TODO: Should consider `shard_weight` when writing data into different shards, may be also
-     * `replica_num`.
-     */
-    private static final String QUERY_CLUSTER_INFO_SQL =
-            "SELECT shard_num, host_address, port FROM system.clusters WHERE cluster = ? and replica_num = 1 ORDER BY shard_num ASC";
 
     private final ClickHouseConnectionOptions options;
 
@@ -62,28 +63,29 @@ public class ClickHouseConnectionProvider implements Serializable {
         this.connectionProperties = connectionProperties;
     }
 
+    public boolean isConnectionValid() throws SQLException {
+        return connection != null;
+    }
+
     public synchronized ClickHouseConnection getOrCreateConnection() throws SQLException {
         if (connection == null) {
-            connection = createConnection(options.getUrl(), options.getDatabaseName());
+            connection = createConnection(options.getUrl());
         }
         return connection;
     }
 
-    public synchronized List<ClickHouseConnection> createShardConnections(
-            String shardCluster, String shardDatabase) throws SQLException {
-        List<String> shardUrls = getShardUrls(shardCluster);
-        if (shardUrls.isEmpty()) {
-            throw new SQLException("Unable to query shards in system.clusters");
-        }
-
-        List<ClickHouseConnection> connections = new ArrayList<>();
-        for (String shardUrl : shardUrls) {
+    public synchronized Map<Integer, ClickHouseConnection> createShardConnections(
+            ClusterSpec clusterSpec, String defaultDatabase) throws SQLException {
+        Map<Integer, ClickHouseConnection> connectionMap = new HashMap<>();
+        String urlSuffix = options.getUrlSuffix();
+        for (ShardSpec shardSpec : clusterSpec.getShards()) {
+            String shardUrl = shardSpec.getJdbcUrls() + urlSuffix;
             ClickHouseConnection connection =
-                    createAndStoreShardConnection(shardUrl, shardDatabase);
-            connections.add(connection);
+                    createAndStoreShardConnection(shardUrl, defaultDatabase);
+            connectionMap.put(shardSpec.getNum(), connection);
         }
 
-        return connections;
+        return connectionMap;
     }
 
     public synchronized ClickHouseConnection createAndStoreShardConnection(
@@ -92,41 +94,41 @@ public class ClickHouseConnectionProvider implements Serializable {
             shardConnections = new ArrayList<>();
         }
 
-        ClickHouseConnection connection = createConnection(url, database);
+        ClickHouseConnection connection = createConnection(url);
         shardConnections.add(connection);
         return connection;
     }
 
     public List<String> getShardUrls(String remoteCluster) throws SQLException {
-        List<String> urls = new ArrayList<>();
+        Map<Integer, String> shardsMap = new HashMap<>();
         ClickHouseConnection conn = getOrCreateConnection();
-        try (PreparedStatement stmt = conn.prepareStatement(QUERY_CLUSTER_INFO_SQL)) {
-            stmt.setString(1, remoteCluster);
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    String host = rs.getString("host_address");
-                    int port = getActualHttpPort(host, rs.getInt("port"));
-                    urls.add("clickhouse://" + host + ":" + port);
-                }
-            }
+        ClusterSpec clusterSpec = getClusterSpec(conn, remoteCluster);
+        String urlSuffix = options.getUrlSuffix();
+        for (ShardSpec shardSpec : clusterSpec.getShards()) {
+            String shardUrl = shardSpec.getJdbcUrls() + urlSuffix;
+            shardsMap.put(shardSpec.getNum(), shardUrl);
         }
 
-        return urls;
+        return shardsMap.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(Map.Entry::getValue)
+                .collect(toList());
     }
 
-    private ClickHouseConnection createConnection(String url, String database) throws SQLException {
-        LOG.info("connecting to {}, database {}", url, database);
-
-        String jdbcUrl = ClickHouseUtil.getJdbcUrl(url, database);
-        ClickHouseProperties properties = new ClickHouseProperties(connectionProperties);
-        properties.setUser(options.getUsername().orElse(null));
-        properties.setPassword(options.getPassword().orElse(null));
-        BalancedClickhouseDataSource dataSource =
-                new BalancedClickhouseDataSource(jdbcUrl, properties);
-        if (dataSource.getAllClickhouseUrls().size() > 1) {
-            dataSource.actualize();
+    private ClickHouseConnection createConnection(String url) throws SQLException {
+        LOG.info("connecting to {}", url);
+        Properties configuration = new Properties();
+        configuration.putAll(connectionProperties);
+        if (options.getUsername().isPresent()) {
+            configuration.setProperty(
+                    ClickHouseDefaults.USER.getKey(), options.getUsername().get());
         }
-        return dataSource.getConnection();
+        if (options.getPassword().isPresent()) {
+            configuration.setProperty(
+                    ClickHouseDefaults.PASSWORD.getKey(), options.getPassword().get());
+        }
+        ClickHouseDriver driver = new ClickHouseDriver();
+        return driver.connect(url, configuration);
     }
 
     public void closeConnections() {
@@ -150,32 +152,6 @@ public class ClickHouseConnectionProvider implements Serializable {
             }
 
             shardConnections = null;
-        }
-    }
-
-    private int getActualHttpPort(String host, int port) throws SQLException {
-        try (CloseableHttpClient httpclient = HttpClients.createDefault()) {
-            HttpGet request =
-                    new HttpGet(
-                            (new URIBuilder())
-                                    .setScheme("http")
-                                    .setHost(host)
-                                    .setPort(port)
-                                    .build());
-            HttpResponse response = httpclient.execute(request);
-            int statusCode = response.getStatusLine().getStatusCode();
-            if (statusCode != 200) {
-                String raw = EntityUtils.toString(response.getEntity());
-                Matcher matcher = HTTP_PORT_PATTERN.matcher(raw);
-                if (matcher.find()) {
-                    return Integer.parseInt(matcher.group("port"));
-                }
-                throw new SQLException("Cannot query ClickHouse http port.");
-            }
-
-            return port;
-        } catch (Throwable throwable) {
-            throw new SQLException("Cannot connect to ClickHouse server using HTTP.", throwable);
         }
     }
 }

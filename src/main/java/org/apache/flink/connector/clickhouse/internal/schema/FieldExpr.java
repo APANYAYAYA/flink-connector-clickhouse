@@ -15,32 +15,33 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.clickhouse.split;
+package org.apache.flink.connector.clickhouse.internal.schema;
+
+import javax.annotation.Nonnull;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.StringUtils.isNullOrWhitespaceOnly;
 
-/** For example, $columnName BETWEEN ? AND ? */
-public class ClickHouseBatchBetweenParametersProvider extends ClickHouseBetweenParametersProvider {
+/** Column expression. */
+public class FieldExpr extends Expression {
 
-    public ClickHouseBatchBetweenParametersProvider(long minVal, long maxVal) {
-        super(minVal, maxVal);
+    private final String columnName;
+
+    private FieldExpr(String columnName) {
+        checkArgument(!isNullOrWhitespaceOnly(columnName), "columnName cannot be null or empty");
+        this.columnName = columnName;
+    }
+
+    public static FieldExpr of(@Nonnull String columnName) {
+        return new FieldExpr(columnName);
+    }
+
+    public String getColumnName() {
+        return columnName;
     }
 
     @Override
-    public ClickHouseBatchBetweenParametersProvider ofBatchNum(Integer batchNum) {
-        checkArgument(batchNum != null && batchNum > 0, "Batch number must be positive");
-
-        long maxElemCount = defaultMaxIfLTZero((maxVal - minVal) + 1);
-        if (batchNum > maxElemCount) {
-            batchNum = (int) maxElemCount;
-        }
-        this.batchNum = batchNum;
-        return this;
-    }
-
-    @Override
-    public ClickHouseBatchBetweenParametersProvider calculate() {
-        this.parameterValues = divideParameterValues(batchNum);
-        return this;
+    public String explain() {
+        return columnName;
     }
 }

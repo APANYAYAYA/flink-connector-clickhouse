@@ -1,3 +1,20 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse.util;
 
 import org.apache.flink.table.expressions.CallExpression;
@@ -7,10 +24,10 @@ import org.apache.flink.table.expressions.ValueLiteralExpression;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
 import org.apache.flink.table.functions.FunctionDefinition;
 
-import ru.yandex.clickhouse.util.ClickHouseValueFormatter;
+import com.clickhouse.data.ClickHouseValues;
+import com.clickhouse.data.value.ClickHouseDateTimeValue;
 
 import java.sql.Time;
-import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.util.HashMap;
@@ -22,8 +39,9 @@ import java.util.function.Function;
 
 import static java.util.stream.Collectors.joining;
 import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.EMPTY;
+import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.getFlinkTimeZone;
 import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.quoteIdentifier;
-import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.toFixedDateTimestamp;
+import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.toLocalDateTime;
 import static org.apache.flink.connector.clickhouse.util.SqlClause.AND;
 import static org.apache.flink.connector.clickhouse.util.SqlClause.EQ;
 import static org.apache.flink.connector.clickhouse.util.SqlClause.GT;
@@ -177,36 +195,30 @@ public class FilterPushDownHelper {
                 .map(
                         o -> {
                             TimeZone timeZone = getFlinkTimeZone();
-                            String value;
+                            Object value;
                             if (o instanceof Time) {
                                 value =
-                                        ClickHouseValueFormatter.formatTimestamp(
-                                                toFixedDateTimestamp(((Time) o).toLocalTime()),
+                                        ClickHouseDateTimeValue.of(
+                                                toLocalDateTime(((Time) o).toLocalTime()),
+                                                0,
                                                 timeZone);
                             } else if (o instanceof LocalTime) {
                                 value =
-                                        ClickHouseValueFormatter.formatTimestamp(
-                                                toFixedDateTimestamp((LocalTime) o), timeZone);
+                                        ClickHouseDateTimeValue.of(
+                                                toLocalDateTime(((LocalTime) o)), 0, timeZone);
                             } else if (o instanceof Instant) {
+                                Instant instant = (Instant) o;
                                 value =
-                                        ClickHouseValueFormatter.formatTimestamp(
-                                                Timestamp.from((Instant) o), timeZone);
+                                        ClickHouseDateTimeValue.of(
+                                                instant.atZone(timeZone.toZoneId())
+                                                        .toLocalDateTime(),
+                                                0,
+                                                timeZone);
                             } else {
-                                value =
-                                        ClickHouseValueFormatter.formatObject(
-                                                o, timeZone, timeZone);
+                                value = o;
                             }
 
-                            value =
-                                    ClickHouseValueFormatter.needsQuoting(o)
-                                            ? String.join(EMPTY, "'", value, "'")
-                                            : value;
-                            return value;
+                            return ClickHouseValues.convertToSqlExpression(value);
                         });
-    }
-
-    /** TODO The timezone configured via `table.local-time-zone` should be used. */
-    private static TimeZone getFlinkTimeZone() {
-        return TimeZone.getDefault();
     }
 }

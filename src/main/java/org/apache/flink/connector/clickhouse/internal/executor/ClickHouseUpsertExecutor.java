@@ -1,25 +1,45 @@
-//
-// Source code recreated from a .class file by IntelliJ IDEA
-// (powered by FernFlower decompiler)
-//
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.flink.connector.clickhouse.internal.executor;
 
 import org.apache.flink.api.common.functions.RuntimeContext;
+import org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SinkUpdateStrategy;
 import org.apache.flink.connector.clickhouse.internal.ClickHouseShardOutputFormat;
 import org.apache.flink.connector.clickhouse.internal.connection.ClickHouseConnectionProvider;
+import org.apache.flink.connector.clickhouse.internal.connection.ClickHouseStatementWrapper;
 import org.apache.flink.connector.clickhouse.internal.converter.ClickHouseRowConverter;
 import org.apache.flink.connector.clickhouse.internal.options.ClickHouseDmlOptions;
 import org.apache.flink.table.data.RowData;
 
+import com.clickhouse.jdbc.ClickHouseConnection;
+import com.clickhouse.jdbc.ClickHousePreparedStatement;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.yandex.clickhouse.ClickHouseConnection;
-import ru.yandex.clickhouse.ClickHousePreparedStatement;
 
 import java.sql.SQLException;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.function.Function;
+
+import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SinkUpdateStrategy.DISCARD;
+import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SinkUpdateStrategy.INSERT;
+import static org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SinkUpdateStrategy.UPDATE;
 
 /** ClickHouse's upsert executor. */
 public class ClickHouseUpsertExecutor implements ClickHouseExecutor {
@@ -42,17 +62,21 @@ public class ClickHouseUpsertExecutor implements ClickHouseExecutor {
 
     private final Function<RowData, RowData> updateExtractor;
 
-    private final Function<RowData, RowData> deleteExtractor;
+    private final Function<RowData, RowData> keyExtractor;
 
     private final int maxRetries;
 
+    private final SinkUpdateStrategy updateStrategy;
+
     private final boolean ignoreDelete;
 
-    private transient ClickHousePreparedStatement insertStmt;
+    private final Map<RowData, RowData> reduceBuffer = new HashMap<>();
 
-    private transient ClickHousePreparedStatement updateStmt;
+    private transient ClickHouseStatementWrapper insertStatement;
 
-    private transient ClickHousePreparedStatement deleteStmt;
+    private transient ClickHouseStatementWrapper updateStatement;
+
+    private transient ClickHouseStatementWrapper deleteStatement;
 
     private transient ClickHouseConnectionProvider connectionProvider;
 
@@ -64,7 +88,7 @@ public class ClickHouseUpsertExecutor implements ClickHouseExecutor {
             ClickHouseRowConverter updateConverter,
             ClickHouseRowConverter deleteConverter,
             Function<RowData, RowData> updateExtractor,
-            Function<RowData, RowData> deleteExtractor,
+            Function<RowData, RowData> keyExtractor,
             ClickHouseDmlOptions options) {
         this.insertSql = insertSql;
         this.updateSql = updateSql;
@@ -73,16 +97,23 @@ public class ClickHouseUpsertExecutor implements ClickHouseExecutor {
         this.updateConverter = updateConverter;
         this.deleteConverter = deleteConverter;
         this.updateExtractor = updateExtractor;
-        this.deleteExtractor = deleteExtractor;
+        this.keyExtractor = keyExtractor;
         this.maxRetries = options.getMaxRetries();
-        this.ignoreDelete = options.getIgnoreDelete();
+        this.updateStrategy = options.getUpdateStrategy();
+        this.ignoreDelete = options.isIgnoreDelete();
     }
 
     @Override
     public void prepareStatement(ClickHouseConnection connection) throws SQLException {
-        this.insertStmt = (ClickHousePreparedStatement) connection.prepareStatement(this.insertSql);
-        this.updateStmt = (ClickHousePreparedStatement) connection.prepareStatement(this.updateSql);
-        this.deleteStmt = (ClickHousePreparedStatement) connection.prepareStatement(this.deleteSql);
+        this.insertStatement =
+                new ClickHouseStatementWrapper(
+                        (ClickHousePreparedStatement) connection.prepareStatement(this.insertSql));
+        this.updateStatement =
+                new ClickHouseStatementWrapper(
+                        (ClickHousePreparedStatement) connection.prepareStatement(this.updateSql));
+        this.deleteStatement =
+                new ClickHouseStatementWrapper(
+                        (ClickHousePreparedStatement) connection.prepareStatement(this.deleteSql));
     }
 
     @Override
@@ -96,20 +127,50 @@ public class ClickHouseUpsertExecutor implements ClickHouseExecutor {
     public void setRuntimeContext(RuntimeContext context) {}
 
     @Override
-    public void addToBatch(RowData record) throws SQLException {
+    public void addToBatch(RowData record) {
+        RowData key = keyExtractor.apply(record);
+        reduceBuffer.put(key, record);
+    }
+
+    @Override
+    public void executeBatch() throws SQLException {
+        for (RowData value : reduceBuffer.values()) {
+            addValueToBatch(value);
+        }
+
+        for (ClickHouseStatementWrapper clickHouseStatement :
+                Arrays.asList(insertStatement, updateStatement, deleteStatement)) {
+            if (clickHouseStatement != null) {
+                attemptExecuteBatch(clickHouseStatement, maxRetries);
+            }
+        }
+
+        reduceBuffer.clear();
+    }
+
+    private void addValueToBatch(RowData record) throws SQLException {
         switch (record.getRowKind()) {
             case INSERT:
-                insertConverter.toExternal(record, insertStmt);
-                insertStmt.addBatch();
+                insertConverter.toExternal(record, insertStatement);
+                insertStatement.addBatch();
                 break;
             case UPDATE_AFTER:
-                updateConverter.toExternal(updateExtractor.apply(record), updateStmt);
-                updateStmt.addBatch();
+                if (INSERT.equals(updateStrategy)) {
+                    insertConverter.toExternal(record, insertStatement);
+                    insertStatement.addBatch();
+                } else if (UPDATE.equals(updateStrategy)) {
+                    updateConverter.toExternal(updateExtractor.apply(record), updateStatement);
+                    updateStatement.addBatch();
+                } else if (DISCARD.equals(updateStrategy)) {
+                    LOG.debug("Discard a record of type UPDATE_AFTER: {}", record);
+                } else {
+                    throw new RuntimeException("Unknown update strategy: " + updateStrategy);
+                }
                 break;
             case DELETE:
                 if (!ignoreDelete) {
-                    deleteConverter.toExternal(deleteExtractor.apply(record), deleteStmt);
-                    deleteStmt.addBatch();
+                    deleteConverter.toExternal(keyExtractor.apply(record), deleteStatement);
+                    deleteStatement.addBatch();
                 }
                 break;
             case UPDATE_BEFORE:
@@ -123,22 +184,12 @@ public class ClickHouseUpsertExecutor implements ClickHouseExecutor {
     }
 
     @Override
-    public void executeBatch() throws SQLException {
-        for (ClickHousePreparedStatement clickHousePreparedStatement :
-                Arrays.asList(insertStmt, updateStmt, deleteStmt)) {
-            if (clickHousePreparedStatement != null) {
-                attemptExecuteBatch(clickHousePreparedStatement, maxRetries);
-            }
-        }
-    }
-
-    @Override
     public void closeStatement() {
-        for (ClickHousePreparedStatement clickHousePreparedStatement :
-                Arrays.asList(insertStmt, updateStmt, deleteStmt)) {
-            if (clickHousePreparedStatement != null) {
+        for (ClickHouseStatementWrapper clickHouseStatement :
+                Arrays.asList(insertStatement, updateStatement, deleteStatement)) {
+            if (clickHouseStatement != null) {
                 try {
-                    clickHousePreparedStatement.close();
+                    clickHouseStatement.close();
                 } catch (SQLException exception) {
                     LOG.warn("ClickHouse upsert statement could not be closed.", exception);
                 }
@@ -160,6 +211,8 @@ public class ClickHouseUpsertExecutor implements ClickHouseExecutor {
                 + '\''
                 + ", maxRetries="
                 + maxRetries
+                + ", updateStrategy="
+                + updateStrategy
                 + ", ignoreDelete="
                 + ignoreDelete
                 + ", connectionProvider="

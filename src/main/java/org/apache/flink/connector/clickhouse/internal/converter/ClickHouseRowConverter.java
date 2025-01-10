@@ -1,10 +1,23 @@
-//
-// Source code recreated from a .class file by IntelliJ IDEA
-// (powered by FernFlower decompiler)
-//
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.flink.connector.clickhouse.internal.converter;
 
+import org.apache.flink.connector.clickhouse.internal.connection.ClickHouseStatementWrapper;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -18,22 +31,31 @@ import org.apache.flink.table.types.logical.RowType.RowField;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.util.Preconditions;
 
-import ru.yandex.clickhouse.ClickHousePreparedStatement;
-import ru.yandex.clickhouse.response.ClickHouseResultSet;
+import com.clickhouse.data.value.UnsignedByte;
+import com.clickhouse.data.value.UnsignedInteger;
+import com.clickhouse.data.value.UnsignedLong;
+import com.clickhouse.data.value.UnsignedShort;
+import com.clickhouse.jdbc.ClickHousePreparedStatement;
+import com.clickhouse.jdbc.ClickHouseResultSet;
 
 import java.io.Serializable;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.net.InetAddress;
 import java.sql.Date;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.util.UUID;
 
 import static org.apache.flink.connector.clickhouse.internal.converter.ClickHouseConverterUtils.BOOL_TRUE;
-import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.toFixedDateTimestamp;
+import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.getFlinkTimeZone;
+import static org.apache.flink.connector.clickhouse.util.ClickHouseUtil.toEpochDayOneTimestamp;
 
 /** Row converter，convert flink type to/from ClickHouse type. */
 public class ClickHouseRowConverter implements Serializable {
@@ -72,7 +94,7 @@ public class ClickHouseRowConverter implements Serializable {
         return genericRowData;
     }
 
-    public void toExternal(RowData rowData, ClickHousePreparedStatement statement)
+    public void toExternal(RowData rowData, ClickHouseStatementWrapper statement)
             throws SQLException {
         for (int index = 0; index < rowData.getArity(); index++) {
             if (!rowData.isNullAt(index)) {
@@ -83,46 +105,68 @@ public class ClickHouseRowConverter implements Serializable {
         }
     }
 
-    protected ClickHouseRowConverter.DeserializationConverter createToInternalConverter(
-            LogicalType type) {
+    private DeserializationConverter createToInternalConverter(LogicalType type) {
         switch (type.getTypeRoot()) {
             case NULL:
                 return val -> null;
             case BOOLEAN:
-                return val -> BOOL_TRUE == ((Number) val).intValue();
+                return val -> val instanceof Number ? BOOL_TRUE == ((Number) val).intValue() : val;
             case FLOAT:
             case DOUBLE:
             case INTERVAL_YEAR_MONTH:
             case INTERVAL_DAY_TIME:
-            case INTEGER:
-            case BIGINT:
+            case TINYINT:
             case BINARY:
             case VARBINARY:
                 return val -> val;
-            case TINYINT:
-                return val -> ((Integer) val).byteValue();
             case SMALLINT:
-                return val -> val instanceof Integer ? ((Integer) val).shortValue() : val;
+                return val -> val instanceof UnsignedByte ? ((UnsignedByte) val).shortValue() : val;
+            case INTEGER:
+                return val -> val instanceof UnsignedShort ? ((UnsignedShort) val).intValue() : val;
+            case BIGINT:
+                return val ->
+                        val instanceof UnsignedInteger ? ((UnsignedInteger) val).longValue() : val;
             case DECIMAL:
                 final int precision = ((DecimalType) type).getPrecision();
                 final int scale = ((DecimalType) type).getScale();
-                return val ->
-                        val instanceof BigInteger
-                                ? DecimalData.fromBigDecimal(
-                                        new BigDecimal((BigInteger) val, 0), precision, scale)
-                                : DecimalData.fromBigDecimal((BigDecimal) val, precision, scale);
+                return val -> {
+                    BigDecimal decimalValue =
+                            val instanceof BigDecimal
+                                    ? (BigDecimal) val
+                                    : new BigDecimal(
+                                            val instanceof UnsignedLong
+                                                    ? ((UnsignedLong) val).bigIntegerValue()
+                                                    : (BigInteger) val);
+                    return DecimalData.fromBigDecimal(decimalValue, precision, scale);
+                };
             case DATE:
-                return val -> (int) ((Date) val).toLocalDate().toEpochDay();
+                return val -> (int) ((LocalDate) val).toEpochDay();
             case TIME_WITHOUT_TIME_ZONE:
                 return val -> (int) (((Time) val).toLocalTime().toNanoOfDay() / 1_000_000L);
             case TIMESTAMP_WITH_TIME_ZONE:
             case TIMESTAMP_WITHOUT_TIME_ZONE:
-                return val -> TimestampData.fromTimestamp((Timestamp) val);
+                return val ->
+                        TimestampData.fromLocalDateTime(
+                                val instanceof OffsetDateTime
+                                        ? ((OffsetDateTime) val).toLocalDateTime()
+                                        : (LocalDateTime) val);
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                return val -> TimestampData.fromInstant(((Timestamp) val).toInstant());
+                return val ->
+                        TimestampData.fromInstant(
+                                ((LocalDateTime) val)
+                                        .atZone(getFlinkTimeZone().toZoneId())
+                                        .toInstant());
             case CHAR:
             case VARCHAR:
-                return val -> StringData.fromString((String) val);
+                return val -> {
+                    if (val instanceof UUID) {
+                        return StringData.fromString(val.toString());
+                    } else if (val instanceof InetAddress) {
+                        return StringData.fromString(((InetAddress) val).getHostAddress());
+                    } else {
+                        return StringData.fromString((String) val);
+                    }
+                };
             case ARRAY:
             case MAP:
                 return val -> ClickHouseConverterUtils.toInternal(val, type);
@@ -134,8 +178,7 @@ public class ClickHouseRowConverter implements Serializable {
         }
     }
 
-    protected ClickHouseRowConverter.SerializationConverter createToExternalConverter(
-            LogicalType type) {
+    private SerializationConverter createToExternalConverter(LogicalType type) {
         switch (type.getTypeRoot()) {
             case BOOLEAN:
                 return (val, index, statement) ->
@@ -173,7 +216,7 @@ public class ClickHouseRowConverter implements Serializable {
             case TIME_WITHOUT_TIME_ZONE:
                 return (val, index, statement) -> {
                     LocalTime localTime = LocalTime.ofNanoOfDay(val.getInt(index) * 1_000_000L);
-                    statement.setTimestamp(index + 1, toFixedDateTimestamp(localTime));
+                    statement.setTimestamp(index + 1, toEpochDayOneTimestamp(localTime));
                 };
             case TIMESTAMP_WITH_TIME_ZONE:
             case TIMESTAMP_WITHOUT_TIME_ZONE:
@@ -221,18 +264,20 @@ public class ClickHouseRowConverter implements Serializable {
 
     @FunctionalInterface
     interface SerializationConverter extends Serializable {
+
         /**
-         * Convert a internal field to to java object and fill into the {@link
+         * Convert an internal field to java object and fill into the {@link
          * ClickHousePreparedStatement}.
          */
-        void serialize(RowData rowData, int index, ClickHousePreparedStatement statement)
+        void serialize(RowData rowData, int index, ClickHouseStatementWrapper statement)
                 throws SQLException;
     }
 
     @FunctionalInterface
     interface DeserializationConverter extends Serializable {
+
         /**
-         * Convert a object of {@link ClickHouseResultSet} to the internal data structure object.
+         * Convert an object of {@link ClickHouseResultSet} to the internal data structure object.
          */
         Object deserialize(Object field) throws SQLException;
     }

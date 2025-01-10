@@ -1,34 +1,57 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse.internal;
 
-import org.apache.flink.connector.clickhouse.internal.common.DistributedEngineFullSchema;
 import org.apache.flink.connector.clickhouse.internal.connection.ClickHouseConnectionProvider;
 import org.apache.flink.connector.clickhouse.internal.executor.ClickHouseExecutor;
 import org.apache.flink.connector.clickhouse.internal.options.ClickHouseDmlOptions;
 import org.apache.flink.connector.clickhouse.internal.partitioner.ClickHousePartitioner;
-import org.apache.flink.connector.clickhouse.util.ClickHouseUtil;
+import org.apache.flink.connector.clickhouse.internal.schema.ClusterSpec;
+import org.apache.flink.connector.clickhouse.internal.schema.DistributedEngineFull;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.util.Preconditions;
 
-import ru.yandex.clickhouse.ClickHouseConnection;
+import com.clickhouse.jdbc.ClickHouseConnection;
 
 import javax.annotation.Nonnull;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * The shard output format of distributed table.<br>
- * TODO: Use ClickHouse's sharding key to distribute data to different instances.
- */
+/** The shard output format of distributed table. */
 public class ClickHouseShardOutputFormat extends AbstractClickHouseOutputFormat {
 
     private static final long serialVersionUID = 1L;
 
     private final ClickHouseConnectionProvider connectionProvider;
 
+    private final ClusterSpec clusterSpec;
+
+    private final DistributedEngineFull shardTableSchema;
+
     private final String[] fieldNames;
+
+    private final String[] keyFields;
+
+    private final String[] partitionFields;
 
     private final LogicalType[] logicalTypes;
 
@@ -36,16 +59,14 @@ public class ClickHouseShardOutputFormat extends AbstractClickHouseOutputFormat 
 
     private final ClickHouseDmlOptions options;
 
-    private final List<ClickHouseExecutor> shardExecutors;
+    private final Map<Integer, ClickHouseExecutor> shardExecutorMap;
 
-    private final String[] keyFields;
-
-    private final String[] partitionFields;
-
-    private transient int[] batchCounts;
+    private final Map<Integer, AtomicInteger> batchCountMap;
 
     protected ClickHouseShardOutputFormat(
             @Nonnull ClickHouseConnectionProvider connectionProvider,
+            @Nonnull ClusterSpec clusterSpec,
+            @Nonnull DistributedEngineFull shardTableSchema,
             @Nonnull String[] fieldNames,
             @Nonnull String[] keyFields,
             @Nonnull String[] partitionFields,
@@ -53,35 +74,26 @@ public class ClickHouseShardOutputFormat extends AbstractClickHouseOutputFormat 
             @Nonnull ClickHousePartitioner partitioner,
             @Nonnull ClickHouseDmlOptions options) {
         this.connectionProvider = Preconditions.checkNotNull(connectionProvider);
+        this.clusterSpec = Preconditions.checkNotNull(clusterSpec);
+        this.shardTableSchema = Preconditions.checkNotNull(shardTableSchema);
         this.fieldNames = Preconditions.checkNotNull(fieldNames);
         this.keyFields = keyFields;
         this.partitionFields = partitionFields;
         this.logicalTypes = Preconditions.checkNotNull(logicalTypes);
         this.partitioner = Preconditions.checkNotNull(partitioner);
         this.options = Preconditions.checkNotNull(options);
-        this.shardExecutors = new ArrayList<>();
+        this.shardExecutorMap = new HashMap<>();
+        this.batchCountMap = new HashMap<>();
     }
 
     @Override
     public void open(int taskNumber, int numTasks) throws IOException {
         try {
-            // Get the local table of distributed table.
-            DistributedEngineFullSchema shardTableSchema =
-                    ClickHouseUtil.getAndParseDistributedEngineSchema(
-                            connectionProvider.getOrCreateConnection(),
-                            options.getDatabaseName(),
-                            options.getTableName());
-            if (shardTableSchema == null) {
-                throw new RuntimeException(
-                        String.format(
-                                "table `%s`.`%s` is not a Distributed table",
-                                options.getDatabaseName(), options.getTableName()));
-            }
-
-            List<ClickHouseConnection> shardConnections =
+            Map<Integer, ClickHouseConnection> connectionMap =
                     connectionProvider.createShardConnections(
-                            shardTableSchema.getCluster(), shardTableSchema.getDatabase());
-            for (ClickHouseConnection shardConnection : shardConnections) {
+                            clusterSpec, shardTableSchema.getDatabase());
+            for (Map.Entry<Integer, ClickHouseConnection> connectionEntry :
+                    connectionMap.entrySet()) {
                 ClickHouseExecutor executor =
                         ClickHouseExecutor.createClickHouseExecutor(
                                 shardTableSchema.getTable(),
@@ -92,11 +104,10 @@ public class ClickHouseShardOutputFormat extends AbstractClickHouseOutputFormat 
                                 partitionFields,
                                 logicalTypes,
                                 options);
-                executor.prepareStatement(shardConnection);
-                shardExecutors.add(executor);
+                executor.prepareStatement(connectionEntry.getValue());
+                shardExecutorMap.put(connectionEntry.getKey(), executor);
             }
 
-            batchCounts = new int[shardConnections.size()];
             long flushIntervalMillis = options.getFlushInterval().toMillis();
             scheduledFlush(flushIntervalMillis, "clickhouse-shard-output-format");
         } catch (Exception exception) {
@@ -104,10 +115,6 @@ public class ClickHouseShardOutputFormat extends AbstractClickHouseOutputFormat 
         }
     }
 
-    /**
-     * TODO: It's not appropriate to write records in this way, we should adapt it to ClickHouse's
-     * data shard strategy.
-     */
     @Override
     public synchronized void writeRecord(RowData record) throws IOException {
         checkFlushException();
@@ -130,11 +137,14 @@ public class ClickHouseShardOutputFormat extends AbstractClickHouseOutputFormat 
 
     private void writeRecordToOneExecutor(RowData record) throws IOException {
         try {
-            int selected = partitioner.select(record, shardExecutors.size());
-            shardExecutors.get(selected).addToBatch(record);
-            batchCounts[selected]++;
-            if (batchCounts[selected] >= options.getBatchSize()) {
-                flush(selected);
+            int shardNum = partitioner.select(record, clusterSpec);
+            shardExecutorMap.get(shardNum).addToBatch(record);
+            int batchCount =
+                    batchCountMap
+                            .computeIfAbsent(shardNum, integer -> new AtomicInteger(0))
+                            .incrementAndGet();
+            if (batchCount >= options.getBatchSize()) {
+                flush(shardNum);
             }
         } catch (Exception exception) {
             throw new IOException("Writing record to one executor failed.", exception);
@@ -143,21 +153,22 @@ public class ClickHouseShardOutputFormat extends AbstractClickHouseOutputFormat 
 
     @Override
     public synchronized void flush() throws IOException {
-        for (int i = 0; i < shardExecutors.size(); i++) {
-            flush(i);
+        for (Integer shardNum : shardExecutorMap.keySet()) {
+            flush(shardNum);
         }
     }
 
-    private synchronized void flush(int index) throws IOException {
-        if (batchCounts[index] > 0) {
-            checkBeforeFlush(shardExecutors.get(index));
-            batchCounts[index] = 0;
+    private synchronized void flush(int shardNum) throws IOException {
+        AtomicInteger batchCount = batchCountMap.get(shardNum);
+        if (batchCount != null && batchCount.intValue() > 0) {
+            checkBeforeFlush(shardExecutorMap.get(shardNum));
+            batchCount.set(0);
         }
     }
 
     @Override
     public synchronized void closeOutputFormat() {
-        for (ClickHouseExecutor shardExecutor : shardExecutors) {
+        for (ClickHouseExecutor shardExecutor : shardExecutorMap.values()) {
             shardExecutor.closeStatement();
         }
         connectionProvider.closeConnections();

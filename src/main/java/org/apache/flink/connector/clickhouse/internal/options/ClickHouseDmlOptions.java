@@ -1,8 +1,30 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink.connector.clickhouse.internal.options;
+
+import org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SinkShardingStrategy;
+import org.apache.flink.connector.clickhouse.config.ClickHouseConfigOptions.SinkUpdateStrategy;
 
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
 
 /** ClickHouse data modify language options. */
 public class ClickHouseDmlOptions extends ClickHouseConnectionOptions {
@@ -17,9 +39,13 @@ public class ClickHouseDmlOptions extends ClickHouseConnectionOptions {
 
     private final boolean useLocal;
 
-    private final String partitionStrategy;
+    private final SinkUpdateStrategy updateStrategy;
 
-    private final String partitionKey;
+    private final SinkShardingStrategy shardingStrategy;
+
+    private final List<String> shardingKey;
+
+    private final boolean shardingUseTableDef;
 
     private final boolean ignoreDelete;
 
@@ -35,8 +61,10 @@ public class ClickHouseDmlOptions extends ClickHouseConnectionOptions {
             Duration flushInterval,
             int maxRetires,
             boolean useLocal,
-            String partitionStrategy,
-            String partitionKey,
+            SinkUpdateStrategy updateStrategy,
+            SinkShardingStrategy shardingStrategy,
+            List<String> shardingKey,
+            boolean shardingUseTableDef,
             boolean ignoreDelete,
             Integer parallelism) {
         super(url, username, password, databaseName, tableName);
@@ -44,8 +72,10 @@ public class ClickHouseDmlOptions extends ClickHouseConnectionOptions {
         this.flushInterval = flushInterval;
         this.maxRetries = maxRetires;
         this.useLocal = useLocal;
-        this.partitionStrategy = partitionStrategy;
-        this.partitionKey = partitionKey;
+        this.updateStrategy = updateStrategy;
+        this.shardingStrategy = shardingStrategy;
+        this.shardingKey = shardingKey;
+        this.shardingUseTableDef = shardingUseTableDef;
         this.ignoreDelete = ignoreDelete;
         this.parallelism = parallelism;
     }
@@ -66,15 +96,23 @@ public class ClickHouseDmlOptions extends ClickHouseConnectionOptions {
         return this.useLocal;
     }
 
-    public String getPartitionStrategy() {
-        return this.partitionStrategy;
+    public SinkUpdateStrategy getUpdateStrategy() {
+        return updateStrategy;
     }
 
-    public String getPartitionKey() {
-        return this.partitionKey;
+    public SinkShardingStrategy getShardingStrategy() {
+        return this.shardingStrategy;
     }
 
-    public boolean getIgnoreDelete() {
+    public List<String> getShardingKey() {
+        return this.shardingKey;
+    }
+
+    public boolean isShardingUseTableDef() {
+        return shardingUseTableDef;
+    }
+
+    public boolean isIgnoreDelete() {
         return this.ignoreDelete;
     }
 
@@ -92,81 +130,87 @@ public class ClickHouseDmlOptions extends ClickHouseConnectionOptions {
         private int batchSize;
         private Duration flushInterval;
         private int maxRetries;
-        private boolean writeLocal;
         private boolean useLocal;
-        private String partitionStrategy;
-        private String partitionKey;
+        private SinkUpdateStrategy updateStrategy;
+        private SinkShardingStrategy shardingStrategy;
+        private List<String> shardingKey;
+        private boolean shardingUseTableDef;
         private boolean ignoreDelete;
         private Integer parallelism;
 
         public Builder() {}
 
-        public ClickHouseDmlOptions.Builder withUrl(String url) {
+        public Builder withUrl(String url) {
             this.url = url;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withUsername(String username) {
+        public Builder withUsername(String username) {
             this.username = username;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withPassword(String password) {
+        public Builder withPassword(String password) {
             this.password = password;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withDatabaseName(String databaseName) {
+        public Builder withDatabaseName(String databaseName) {
             this.databaseName = databaseName;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withTableName(String tableName) {
+        public Builder withTableName(String tableName) {
             this.tableName = tableName;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withBatchSize(int batchSize) {
+        public Builder withBatchSize(int batchSize) {
             this.batchSize = batchSize;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withFlushInterval(Duration flushInterval) {
+        public Builder withFlushInterval(Duration flushInterval) {
             this.flushInterval = flushInterval;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withMaxRetries(int maxRetries) {
+        public Builder withMaxRetries(int maxRetries) {
             this.maxRetries = maxRetries;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withWriteLocal(Boolean writeLocal) {
-            this.writeLocal = writeLocal;
+        public Builder withUpdateStrategy(SinkUpdateStrategy updateStrategy) {
+            this.updateStrategy = updateStrategy;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withUseLocal(Boolean useLocal) {
+        public Builder withUseLocal(Boolean useLocal) {
             this.useLocal = useLocal;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withPartitionStrategy(String partitionStrategy) {
-            this.partitionStrategy = partitionStrategy;
+        public Builder withShardingStrategy(SinkShardingStrategy shardingStrategy) {
+            this.shardingStrategy = shardingStrategy;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withPartitionKey(String partitionKey) {
-            this.partitionKey = partitionKey;
+        public Builder withShardingKey(String shardingKey) {
+            this.shardingKey = Collections.singletonList(shardingKey);
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withIgnoreDelete(boolean ignoreDelete) {
+        public Builder withUseTableDef(boolean shardingUseTableDef) {
+            this.shardingUseTableDef = shardingUseTableDef;
+            return this;
+        }
+
+        public Builder withIgnoreDelete(boolean ignoreDelete) {
             this.ignoreDelete = ignoreDelete;
             return this;
         }
 
-        public ClickHouseDmlOptions.Builder withParallelism(Integer parallelism) {
+        public Builder withParallelism(Integer parallelism) {
             this.parallelism = parallelism;
             return this;
         }
@@ -181,9 +225,11 @@ public class ClickHouseDmlOptions extends ClickHouseConnectionOptions {
                     batchSize,
                     flushInterval,
                     maxRetries,
-                    writeLocal || useLocal,
-                    partitionStrategy,
-                    partitionKey,
+                    useLocal,
+                    updateStrategy,
+                    shardingStrategy,
+                    shardingKey,
+                    shardingUseTableDef,
                     ignoreDelete,
                     parallelism);
         }

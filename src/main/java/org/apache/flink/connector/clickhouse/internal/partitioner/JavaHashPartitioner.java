@@ -18,29 +18,34 @@
 package org.apache.flink.connector.clickhouse.internal.partitioner;
 
 import org.apache.flink.connector.clickhouse.internal.schema.ClusterSpec;
-import org.apache.flink.connector.clickhouse.internal.schema.ShardSpec;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.RowData.FieldGetter;
 
-import java.io.Serializable;
+import java.util.List;
+import java.util.Objects;
 
-/** ClickHouse data partitioner interface. */
-public abstract class ClickHousePartitioner implements Serializable {
+import static java.util.Objects.nonNull;
+import static org.apache.flink.util.Preconditions.checkArgument;
 
-    private static final long serialVersionUID = 1L;
+/**
+ * Same as ClickHouse's hash function `javaHash`. <br>
+ * ! Extended to integers from ClickHouse release 22.10.
+ */
+public class JavaHashPartitioner extends ClickHousePartitioner {
 
-    public abstract int select(RowData record, ClusterSpec clusterSpec);
+    private final FieldGetter fieldGetter;
 
-    public int select(long value, ClusterSpec clusterSpec) {
-        value = Math.abs(value);
-        for (ShardSpec shard : clusterSpec.getShards()) {
-            if (shard.isInShardRangeBounds(value)) {
-                return shard.getNum();
-            }
-        }
+    public JavaHashPartitioner(List<FieldGetter> getters) {
+        checkArgument(
+                getters.size() == 1 && nonNull(getters.get(0)),
+                "The parameter number of JavaHashPartitioner must be 1");
+        this.fieldGetter = getters.get(0);
+    }
 
-        throw new IllegalStateException(
-                String.format(
-                        "Unreachable, partitioner: %s must has some kind of bug",
-                        this.getClass().getName()));
+    @Override
+    public int select(RowData record, ClusterSpec clusterSpec) {
+        long weightSum = clusterSpec.getWeightSum();
+        long result = Objects.hashCode(fieldGetter.getFieldOrNull(record)) % weightSum;
+        return select(result, clusterSpec);
     }
 }
